@@ -34,7 +34,7 @@ Regenerate it with <code>tools/record_demo.py</code>.</sub>
 ## Installation
 
 ```bash
-git clone https://github.com/<user>/pptx-vo-elevenlabs.git
+git clone https://github.com/x0n1-nh/pptx-vo-elevenlabs.git
 cd pptx-vo-elevenlabs
 pip install -r requirements.txt
 ```
