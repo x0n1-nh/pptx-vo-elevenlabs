@@ -128,9 +128,12 @@ def run(_server, tmp_path):
     """Runs vo.py in the test folder, against the fake server, with no wait between retries."""
     _, base = _server
 
-    def _run(*args, key=GOOD_KEY, voice="voice123", stdin=None):
-        env = {k: v for k, v in os.environ.items() if not k.startswith("ELEVENLABS_")}
+    def _run(*args, key=GOOD_KEY, voice="voice123", stdin=None, whisper_stub=False, env_extra=None):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("ELEVENLABS_", "VO_STUB_"))}
         env.update(ELEVENLABS_API_BASE=base, VO_RETRY_WAIT="0.01", PYTHONIOENCODING="utf-8")
+        if whisper_stub:      # the fake faster-whisper in tests/stubs shadows any installed one
+            env["PYTHONPATH"] = os.pathsep.join([str(ROOT / "tests" / "stubs"), env.get("PYTHONPATH", "")])
+        env.update(env_extra or {})
         if key:
             env["ELEVENLABS_API_KEY"] = key
         if voice:
@@ -243,4 +246,33 @@ def deck_notes(tmp_path):
     add_click_animations(s2, 1)
     path = tmp_path / "notes.pptx"
     prs.save(path)
+    return path
+
+
+@pytest.fixture
+def deck_plain(tmp_path):
+    """4 slides without comments; slide 2 already has notes for the presenter and an old VO: line."""
+    prs = _new_deck()
+    slides = [_slide(prs, f"Slide {i}") for i in range(1, 5)]
+    slides[1].notes_slide.notes_text_frame.text = "Presenter reminder\nVO: old text"
+    path = tmp_path / "plain.pptx"
+    prs.save(path)
+    return path
+
+
+TRANSCRIPT = """[2026-11-11 10:00:00] Benvenuti al corso.
+[2026-11-11 10:00:04] Oggi parliamo di budget.
+---
+[2026-11-11 10:00:09] > \U0001f4dd **NOTA:** aggiungere un grafico
+[2026-11-11 10:00:12] Il primo passo sono le entrate.
+---
+[2026-11-11 10:00:20] - [ ] controllare i numeri
+"""
+
+
+@pytest.fixture
+def transcript(tmp_path):
+    """A transcript in the voice-2-notes format: 3 blocks, a note, a task."""
+    path = tmp_path / "trascrizione.txt"
+    path.write_text(TRANSCRIPT, encoding="utf-8")
     return path

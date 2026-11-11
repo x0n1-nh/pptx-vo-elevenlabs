@@ -34,7 +34,7 @@ Regenerate it with <code>tools/record_demo.py</code>.</sub>
 ## Installation
 
 ```bash
-git clone https://github.com/x0n1-nh/pptx-vo-elevenlabs.git
+git clone https://github.com/<user>/pptx-vo-elevenlabs.git
 cd pptx-vo-elevenlabs
 pip install -r requirements.txt
 ```
@@ -101,6 +101,8 @@ python vo.py *.pptx -y                      # every deck in the folder, no confi
 python vo.py course.pptx --slides 2,5-7     # only some slides
 python vo.py course.pptx --manual --open    # advance on click, then open the result
 python vo.py course.pptx --fake             # fake audio: test the structure without credits
+python vo.py course.pptx --verify --verify-language it   # check every clip with whisper
+python vo.py course.pptx --import notes.txt # write a dictated transcript into the notes
 ```
 
 `python vo.py --help` lists every option: voice and model, speed and stability, pauses, cache,
@@ -117,6 +119,59 @@ With auto-advance, on-click animations become automatic and start together with 
 
 With `--manual`, animations stay on click and slides advance on click only. The audio still
 plays automatically.
+
+## Dictating the script
+
+If you would rather speak than type, you can dictate the voiceover and import it into the deck.
+`--import` reads a transcript and writes it into the speaker notes as `VO:` lines, one block per
+slide:
+
+```bash
+python vo.py course.pptx --import trascrizione.txt   # writes the notes, then exits
+python vo.py course.pptx --preview                   # after reviewing the text in PowerPoint
+python vo.py course.pptx
+```
+
+It works out of the box with the output of
+[voice-2-notes](https://github.com/elbae/voice-2-notes), a tray app that records the microphone and
+transcribes it offline. Say *"nuovo blocco"* when you move to the next slide: voice-2-notes writes
+a `---` line there, and `--import` puts each block on its own slide. Timestamps are removed, and
+the notes and tasks you dictate (*"nota: …"*, *"task: …"*) are kept in the speaker notes as author
+notes that are never read aloud.
+
+Any text file works too, as long as the slides are separated by `---` lines:
+
+```
+Welcome. In this lesson we will set up a monthly budget.
+---
+Step one is knowing your income.
+```
+
+Blocks go to the slides in order, skipping hidden slides; `--slides 2-6` picks the target slides
+instead. The deck is changed in place, so a backup is saved first (`course.bak-<date>-<time>.pptx`).
+Existing `VO:` lines in the notes are replaced, everything else in the notes is kept. Always review
+the imported text before generating: speech recognition gets technical terms wrong, and the
+synthetic voice would read every mistake.
+
+## Checking the audio
+
+`--verify` transcribes every clip with [faster-whisper](https://github.com/SYSTRAN/faster-whisper),
+locally, and compares it word by word with the `VO:` text. Slides below 85% match are flagged with
+the words that differ, so you know which ones to listen to before you deliver:
+
+```
+  [100%] slide 4: done (9.9 s, check 72% !)
+   - slide 4: the audio matches the text at 72%: "phishing" heard as "fishing"; missing "the link"
+   - audio check: 4 of 5 slides match the text, 1 to listen to (see above)
+```
+
+It needs `pip install faster-whisper`; the model is downloaded on first use (`small`, about 500 MB,
+by default; `--verify-model medium` is more accurate and slower). Set `--verify-language` for short
+clips, where automatic language detection is unreliable. The check also runs on cached audio, so
+`python vo.py course.pptx --verify` on a deck you already generated costs no credits.
+
+A low score is a reason to listen, not proof of an error: numbers written as digits ("3") and
+heard as words ("three"), names and acronyms often lower the score on audio that is fine.
 
 ## How it works
 
@@ -162,8 +217,9 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-They cover reading comments and notes, embedding, cache, re-runs, animation sync, manual mode and
-the error cases: credits exhausted, 429, 5xx, invalid key, unknown voice, locked or broken files.
+They cover reading comments and notes, embedding, cache, re-runs, animation sync, manual mode,
+transcript import, the audio check (with a stand-in for faster-whisper) and the error cases:
+credits exhausted, 429, 5xx, invalid key, unknown voice, locked or broken files.
 
 The demo GIF is regenerated with `python tools/record_demo.py` (Linux or macOS, also needs
 `pip install pyte Pillow`). It uses the same fake server.

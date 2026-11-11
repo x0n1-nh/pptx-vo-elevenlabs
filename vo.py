@@ -11,11 +11,11 @@ Saves <name>_vo.pptx next to the original.
 Re-running is safe: audio is replaced, not duplicated, and only slides whose text changed
 are regenerated (and paid for). All options: python vo.py --help
 """
-import argparse, glob, hashlib, io, json, os, re, shutil, subprocess, sys, time, zipfile
+import argparse, difflib, glob, hashlib, io, json, os, re, shutil, subprocess, sys, time, zipfile
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -67,6 +67,7 @@ CFG = {
     "silent_slide": 4.0,     # duration of slides without "VO:"
     "pause_segment": 1.0,    # pause between two VO: lines on the same slide (max 3)
     "loudness": -16,         # integrated LUFS per slide: even volume across the deck
+    "verify_threshold": 0.85,  # --verify: below this word match, the slide is flagged
 }
 
 
@@ -689,8 +690,8 @@ def expand_decks(items):
             raise VOError(f"No files match {it}.", fatal=False)
         for f in found:
             p = Path(f)
-            if p.name.startswith("~$") or (len(found) > 1 and re.search(r"_vo( \(\d+\))?$", p.stem)):
-                continue                      # Office lock files and outputs of previous runs
+            if p.name.startswith("~$") or (len(found) > 1 and re.search(r"(_vo( \(\d+\))?|\.bak-\d{8}-\d{6})$", p.stem)):
+                continue                      # Office lock files, outputs and backups of previous runs
             out.append(p)
     return list(dict.fromkeys(out))
 
@@ -762,6 +763,162 @@ def open_file(path):
         print(f"  (cannot open {path.name}: {e})")
 
 
+# --------------------------------------------------------------------------- transcript import
+
+_TS_RE = re.compile(r"^\s*\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2})?\]\s*")    # [2026-11-11 10:00:00]
+_SEP_RE = re.compile(r"^\s*-{3,}\s*$")                                             # ---
+_NOTE_RE = re.compile(r"^>\s*(?:[^\w\s*]+\s*)?\*\*\s*([^*:]+?)\s*:?\s*\*\*\s*:?\s*(.*)$")  # > 📝 **NOTA:** text
+_QUOTE_RE = re.compile(r"^>\s*(.*)$")                                              # > text
+_TASK_RE = re.compile(r"^-\s*\[\s*[xX ]?\s*\]\s*(.*)$")                            # - [ ] text
+
+
+def parse_transcript(path):
+    """Reads a transcript -> [{"vo": text to read, "notes": [author notes]}], one block per slide.
+    Works with voice-2-notes output and with any text file: blocks are separated by '---' lines,
+    timestamps such as [2026-11-11 10:00:00] are removed, and notes or tasks
+    ('> 📝 **NOTA:** ...', '- [ ] ...') become author notes that are never read aloud."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8-sig")
+    except OSError as e:
+        raise VOError(f"Cannot read the transcript {path}: {e.strerror or e}.")
+    blocks, cur = [], {"vo": [], "notes": []}
+    for line in raw.splitlines():
+        if _SEP_RE.match(line):
+            blocks.append(cur)
+            cur = {"vo": [], "notes": []}
+            continue
+        line = _TS_RE.sub("", line).strip()
+        if not line:
+            continue
+        m = _NOTE_RE.match(line)
+        if m:
+            cur["notes"].append(f"{m.group(1).strip().upper()}: {m.group(2).strip()}")
+            continue
+        m = _TASK_RE.match(line) or _QUOTE_RE.match(line)
+        if m:
+            cur["notes"].append(("TODO: " if line.startswith("-") else "NOTE: ") + m.group(1).strip())
+            continue
+        cur["vo"].append(line)
+    blocks.append(cur)
+    out = [{"vo": re.sub(r"\s+", " ", " ".join(b["vo"])).strip(), "notes": b["notes"]} for b in blocks]
+    while out and not (out[0]["vo"] or out[0]["notes"]):     # empty blocks at the edges: stray separators
+        out.pop(0)
+    while out and not (out[-1]["vo"] or out[-1]["notes"]):
+        out.pop()
+    return out
+
+
+def write_vo_notes(slide, vo_text, notes):
+    """Replaces the VO: lines in the slide notes with a single VO: line; other notes are kept."""
+    tf = slide.notes_slide.notes_text_frame
+    if tf is None:
+        return False
+    for p in list(tf.paragraphs):
+        if TAG_RE.match(p.text):
+            if len(tf.paragraphs) > 1:
+                p._p.getparent().remove(p._p)
+            else:
+                p.text = ""
+    for line in ([f"VO: {vo_text}"] if vo_text else []) + notes:
+        last = tf.paragraphs[-1]
+        p = last if len(tf.paragraphs) == 1 and not last.text.strip() else tf.add_paragraph()
+        p.text = line
+    return True
+
+
+def cmd_import(deck, transcript, args):
+    """Writes the transcript blocks into the speaker notes of the deck, one block per slide."""
+    blocks = parse_transcript(transcript)
+    if not blocks:
+        raise VOError(f"{Path(transcript).name} contains no text.")
+    prs = open_deck(deck)
+    wanted = parse_slides(args.slides)
+    targets = [(i, sl) for i, sl in enumerate(prs.slides, 1)
+               if (i in wanted if wanted else sl._element.get("show") != "0")]
+    if len(blocks) > len(targets):
+        raise VOError(f"The transcript has {len(blocks)} blocks, but there are only {len(targets)} target slides.",
+                      "Each block (text between two '---' lines, 'nuovo blocco' in voice-2-notes) goes on one "
+                      "slide. Remove the extra blocks, or pick the slides with --slides.")
+    if not writable(deck):
+        raise VOError(f"{deck.name} is open or locked.", "Close it in PowerPoint and run again.")
+    backup = deck.with_name(f"{deck.stem}.bak-{datetime.now():%Y%m%d-%H%M%S}{deck.suffix}")
+    shutil.copy2(deck, backup)
+    print(f"\n{deck.name} <- {Path(transcript).name}  ({len(blocks)} blocks)")
+    warn = []
+    for (n, slide), b in zip(targets, blocks):
+        if not (b["vo"] or b["notes"]):
+            print(f"  slide {n:>2}   (empty block, left as it is)")
+            continue
+        if not write_vo_notes(slide, b["vo"], b["notes"]):
+            warn.append(f"slide {n}: its notes have no text area, block not written")
+            continue
+        txt = b["vo"] or "(author notes only)"
+        print(f"  slide {n:>2} <- {txt if len(txt) <= 70 else txt[:69] + '…'}")
+        if b["notes"]:
+            print(f"             + {len(b['notes'])} author note(s), not read aloud")
+        if b["vo"] and any(TAG_RE.match(c) for c in slide_comments(slide)):
+            warn.append(f"slide {n}: has VO: comments, which take priority over the notes: "
+                        f"the imported text is ignored until you delete them")
+    prs.save(str(deck))
+    if len(blocks) < len(targets):
+        left = [str(n) for n, _ in targets[len(blocks):]]
+        warn.append(f"no block for slide {', '.join(left)}: left as they were")
+    print(f"  saved the text into {deck.name}; backup of the previous version: {backup.name}")
+    for w in warn:
+        print("   - " + w)
+    print("Review the text in PowerPoint (whisper often gets technical terms wrong), then run:\n"
+          f'  python vo.py "{deck.name}" --preview')
+
+
+# --------------------------------------------------------------------------- audio verification
+
+_WHISPER = {}
+
+
+def load_whisper(model_name):
+    """Loads a faster-whisper model once per run (downloaded on first use)."""
+    if model_name not in _WHISPER:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise VOError("--verify needs faster-whisper.",
+                          "pip install faster-whisper (the model is downloaded on first use: ~500 MB for 'small').")
+        try:
+            _WHISPER[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8")
+        except Exception as e:
+            raise VOError(f"Cannot load the whisper model '{model_name}' ({type(e).__name__}: {e}).",
+                          "On first use the model is downloaded from Hugging Face: check your connection or "
+                          "proxy, or pass a local model folder with --verify-model.")
+    return _WHISPER[model_name]
+
+
+def transcribe(path, model, language):
+    segments, _ = model.transcribe(str(path), language=language, beam_size=5)
+    return " ".join(seg.text.strip() for seg in segments)
+
+
+def _words(s):
+    return re.findall(r"\w+", re.sub(r"<[^>]+>", " ", s).lower())
+
+
+def compare_text(expected, heard):
+    """(word match 0-1, [differences]) between the VO: text and what whisper heard."""
+    a, b = _words(expected), _words(heard)
+    if not a and not b:
+        return 1.0, []
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    diffs = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        exp, got = " ".join(a[i1:i2]), " ".join(b[j1:j2])
+        if op == "delete":
+            diffs.append(f'missing "{exp}"')
+        elif op == "insert":
+            diffs.append(f'extra "{got}"')
+        elif op == "replace":
+            diffs.append(f'"{exp}" heard as "{got}"')
+    return sm.ratio(), diffs
+
+
 # --------------------------------------------------------------------------- plan and generation
 
 def plan_deck(path, args, cfg, voice_id):
@@ -808,7 +965,7 @@ def build_deck(p, args, cfg, key, voice_id):
     cache.mkdir(parents=True, exist_ok=True)
     texts = [s["text"] for s in slides]
     total = sum(1 for s in slides if s["text"])
-    done, gen, failed, warn, streak, retimed = 0, 0, [], [], 0, []
+    done, gen, failed, warn, streak, retimed, checked = 0, 0, [], [], 0, [], []
     for idx, (slide, s) in enumerate(zip(prs.slides, slides)):
         if not s["sel"]:
             continue
@@ -876,7 +1033,25 @@ def build_deck(p, args, cfg, key, voice_id):
                 s["adv"] = max(s["adv"], times[-1] + int(cfg["tail"] * 1000))
             set_advance(slide, s["adv"])
         done += 1
-        print(f"\r  [{int(100 * done / total):3d}%] slide {s['n']}: done ({dur:.1f} s)" + " " * 20, flush=True)
+        check = ""
+        if args.verify:
+            print(f"\r  [{int(100 * done / total):3d}%] slide {s['n']}: checking the audio..." + " " * 10,
+                  end="", flush=True)
+            try:
+                heard = transcribe(clean, load_whisper(args.verify_model), args.verify_language)
+                score, diffs = compare_text(s["text"], heard)
+                checked.append(score)
+                check = f", check {score:.0%}"
+                if score < cfg["verify_threshold"]:
+                    check += " !"
+                    shown = "; ".join(diffs[:5]) + ("; …" if len(diffs) > 5 else "")
+                    warn.append(f"slide {s['n']}: the audio matches the text at {score:.0%}: {shown or 'nothing heard'}")
+            except VOError:
+                raise
+            except Exception as e:
+                check = ", check failed"
+                warn.append(f"slide {s['n']}: audio check failed ({type(e).__name__}: {e})")
+        print(f"\r  [{int(100 * done / total):3d}%] slide {s['n']}: done ({dur:.1f} s{check})" + " " * 20, flush=True)
 
     out = p["out"]
     if not writable(out):
@@ -900,6 +1075,10 @@ def build_deck(p, args, cfg, key, voice_id):
     if mute:
         extra = "" if args.manual else f" (shown for {cfg['silent_slide']:.0f} s)"
         warn.insert(0, f"no 'VO:'{extra}: slide {', '.join(mute)}")
+    if checked:
+        low = sum(1 for c in checked if c < cfg["verify_threshold"])
+        warn.append(f"audio check: {len(checked) - low} of {len(checked)} slides match the text"
+                    + (f", {low} to listen to (see above)" if low else ""))
     if retimed:
         warn.append(f"on-click animations made automatic, synced with the voice: slide "
                     f"{', '.join(map(str, retimed))} (with --manual they stay on click)")
@@ -973,6 +1152,9 @@ examples:
   python vo.py *.pptx -y                      every deck in the folder, no confirmation
   python vo.py course.pptx --slides 2,5-7     only some slides (the others stay silent)
   python vo.py course.pptx --manual --open    advance on click, then open the result
+  python vo.py course.pptx --verify --verify-language it
+                                              generate, then check every clip with whisper
+  python vo.py course.pptx --import notes.txt write a dictated transcript into the notes
   python vo.py --check                        check key, voice, ffmpeg and credits
   python vo.py --voices                       list voices with their IDs
 
@@ -1030,7 +1212,17 @@ def build_parser():
         help=f"duration of slides without VO: (default {CFG['silent_slide']})")
     opt(g, ["--icon-inside"], ["--icona-dentro"], action="store_true",
         help="put the audio icon in the bottom-right corner of the slide (default: off-slide, invisible)")
+    g = ap.add_argument_group("audio check (needs: pip install faster-whisper)")
+    opt(g, ["--verify"], action="store_true",
+        help="transcribe each clip with whisper and flag slides where the audio differs from the text")
+    opt(g, ["--verify-model"], metavar="NAME", default="small",
+        help="whisper model name or local folder (default: small)")
+    opt(g, ["--verify-language"], metavar="CODE",
+        help="language of the voiceover, e.g. it or en (default: auto-detect; set it for short clips)")
     g = ap.add_argument_group("files")
+    opt(g, ["--import"], dest="import_file", metavar="FILE",
+        help="write a transcript (voice-2-notes, or any text with --- between slides) into the speaker "
+             "notes as VO: lines, then exit. Makes a backup of the deck first")
     opt(g, ["-o", "--output"], metavar="FILE", help="output file (single deck only)")
     opt(g, ["--cache"], metavar="DIR", help="audio cache folder (default: vo_cache next to the deck)")
     opt(g, ["--open"], ["--apri"], action="store_true", help="open the result when done")
@@ -1084,6 +1276,13 @@ def main():
                 raise VOError(f"--{opt_name.replace('_', '-')} cannot be negative.")
             cfg[k] = v
 
+    if args.import_file:
+        decks = expand_decks(args.deck)
+        if len(decks) != 1:
+            raise VOError("--import works with a single deck.")
+        cmd_import(decks[0], args.import_file, args)
+        return 0
+
     check_ffmpeg()
     decks = expand_decks(args.deck)
     if args.output and len(decks) > 1:
@@ -1126,6 +1325,11 @@ def main():
                 raise VOError(f"About {need} credits needed, you have {left}.",
                               (f"Credits reset on {reset}. " if reset else "") +
                               "You can generate part of it with --slides, or upgrade your plan.")
+
+    # the whisper model is loaded (and downloaded, the first time) before any credit is spent
+    if args.verify:
+        print(f"Loading the whisper model '{args.verify_model}' for the audio check...")
+        load_whisper(args.verify_model)
 
     # 3. confirmation
     if need and not args.fake and not args.yes:
