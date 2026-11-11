@@ -52,7 +52,23 @@ NS = {
 RT_AUDIO = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/audio"
 RT_MEDIA = "http://schemas.microsoft.com/office/2007/relationships/media"
 SHAPE_PREFIX = "VO-auto"          # name of the shapes this script creates (used to replace them)
-API = os.environ.get("ELEVENLABS_API_BASE", "https://api.elevenlabs.io")   # override for tests only
+
+
+def _api_base():
+    """ElevenLabs API address. ELEVENLABS_API_BASE exists only for the tests' local fake server: any
+    host other than localhost is refused, so an environment variable can never send the key elsewhere."""
+    base = os.environ.get("ELEVENLABS_API_BASE")
+    if not base:
+        return "https://api.elevenlabs.io"
+    from urllib.parse import urlparse
+    if urlparse(base).hostname not in ("127.0.0.1", "localhost", "::1"):
+        sys.exit(f"ERROR: ELEVENLABS_API_BASE={base} refused: only a local test server is allowed.\n"
+                 f"Fix: remove the ELEVENLABS_API_BASE environment variable.")
+    return base.rstrip("/")
+
+
+API = _api_base()
+
 MAX_CHARS_PER_SLIDE = 9500        # below ElevenLabs' per-request limit
 TAG_RE = re.compile(r"^\s*VO\s*:\s*", re.I)
 YES = ("y", "yes", "s", "si", "sì")

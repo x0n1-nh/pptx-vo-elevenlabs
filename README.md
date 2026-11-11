@@ -218,14 +218,12 @@ pytest
 ```
 
 They cover reading comments and notes, embedding, cache, re-runs, animation sync, manual mode,
-transcript import, the audio check (with a stand-in for faster-whisper) and the error cases:
-credits exhausted, 429, 5xx, invalid key, unknown voice, locked or broken files.
+transcript import, the audio check and the error cases: credits exhausted, 429, 5xx, invalid key,
+unknown voice, locked or broken files. The audio check runs against a stand-in for faster-whisper,
+so the tests need no model download.
 
 The demo GIF is regenerated with `python tools/record_demo.py` (Linux or macOS, also needs
 `pip install pyte Pillow`). It uses the same fake server.
-
-`ELEVENLABS_API_BASE` overrides the API address and is meant **for tests only**. The script reads
-it from the environment, never from the `.env` file.
 
 ## License
 

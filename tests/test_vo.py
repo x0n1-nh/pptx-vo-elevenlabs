@@ -249,3 +249,11 @@ def test_help(run):
     p = run("--help", key=None, voice=None)
     assert p.returncode == 0 and "--preview" in p.out and "examples:" in p.out
     assert "--anteprima" not in p.out                 # legacy names stay hidden
+
+
+@pytest.mark.parametrize("base", ["https://evil.example.com", "http://127.0.0.1@evil.example.com",
+                                  "http://localhost.evil.example.com"])
+def test_api_override_only_for_localhost(run, api, deck_comments, base):
+    p = run(deck_comments.name, "-y", env_extra={"ELEVENLABS_API_BASE": base})
+    assert p.returncode == 1 and "refused" in p.out
+    assert api.tts_calls == []
